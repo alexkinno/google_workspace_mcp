@@ -330,6 +330,10 @@ async def list_spaces(
     """
     Lists Google Chat spaces (rooms and direct messages) accessible to the user.
 
+    Args:
+        space_type: "room" for named spaces, "dm" for direct messages and group
+                    chats, or "all" for everything.
+
     Direct messages and unnamed group chats have no displayName in the Chat API,
     so they are named after their members instead.
 
@@ -344,7 +348,8 @@ async def list_spaces(
     if space_type == "room":
         filter_param = 'spaceType = "SPACE"'
     elif space_type == "dm":
-        filter_param = 'spaceType = "DIRECT_MESSAGE"'
+        # Group chats are unnamed conversations too, so "dm" covers both.
+        filter_param = 'spaceType = "GROUP_CHAT" OR spaceType = "DIRECT_MESSAGE"'
 
     request_params = {"pageSize": page_size}
     if filter_param:

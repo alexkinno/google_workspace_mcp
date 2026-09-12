@@ -1260,7 +1260,7 @@ async def test_space_name_resolution_is_cached_across_calls():
 @pytest.mark.parametrize(
     ("space_type", "expected_filter"),
     [
-        ("dm", 'spaceType = "DIRECT_MESSAGE"'),
+        ("dm", 'spaceType = "GROUP_CHAT" OR spaceType = "DIRECT_MESSAGE"'),
         ("room", 'spaceType = "SPACE"'),
     ],
 )
