@@ -9,7 +9,7 @@ import logging
 import asyncio
 import re
 import ssl
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from googleapiclient.errors import HttpError
@@ -24,21 +24,95 @@ from core.utils import TransientNetworkError, UserInputError, handle_http_errors
 
 logger = logging.getLogger(__name__)
 
-# In-memory cache for user ID → display name (bounded to avoid unbounded growth)
+# In-memory cache for user ID → (display name, email) (bounded to avoid unbounded growth)
 _SENDER_CACHE_MAX_SIZE = 256
-_sender_name_cache: Dict[str, str] = {}
+_user_identity_cache: Dict[str, Tuple[str, Optional[str]]] = {}
+# In-memory cache for space ID → resolved display name, for spaces the Chat API
+# leaves unnamed (direct messages and unnamed group chats).
+_SPACE_NAME_CACHE_MAX_SIZE = 256
+_space_name_cache: Dict[str, str] = {}
+_SPACE_MEMBERS_PAGE_SIZE = 100
+# Naming an unnamed space costs one memberships call plus a People lookup per
+# member, all sequential, so cap how many we resolve when listing many spaces.
+_MAX_UNNAMED_SPACE_RESOLUTIONS = 50
 _SEARCH_MESSAGES_MAX_CONCURRENT_SPACE_FETCHES = 1
 _SEARCH_MESSAGES_SSL_RETRIES = 3
 _SEARCH_MESSAGES_RETRY_BASE_DELAY_SECONDS = 1
 
 
-def _cache_sender(user_id: str, name: str) -> None:
-    """Store a resolved sender name, evicting oldest entries if cache is full."""
-    if len(_sender_name_cache) >= _SENDER_CACHE_MAX_SIZE:
-        to_remove = list(_sender_name_cache.keys())[: _SENDER_CACHE_MAX_SIZE // 2]
+def _cache_user_identity(user_id: str, identity: Tuple[str, Optional[str]]) -> None:
+    """Store a resolved user identity, evicting oldest entries if cache is full."""
+    if len(_user_identity_cache) >= _SENDER_CACHE_MAX_SIZE:
+        to_remove = list(_user_identity_cache.keys())[: _SENDER_CACHE_MAX_SIZE // 2]
         for k in to_remove:
-            del _sender_name_cache[k]
-    _sender_name_cache[user_id] = name
+            del _user_identity_cache[k]
+    _user_identity_cache[user_id] = identity
+
+
+def _cache_space_name(space_id: str, name: str) -> None:
+    """Store a resolved space name, evicting oldest entries if cache is full."""
+    if len(_space_name_cache) >= _SPACE_NAME_CACHE_MAX_SIZE:
+        to_remove = list(_space_name_cache.keys())[: _SPACE_NAME_CACHE_MAX_SIZE // 2]
+        for k in to_remove:
+            del _space_name_cache[k]
+    _space_name_cache[space_id] = name
+
+
+def _same_user(email: Optional[str], other_email: Optional[str]) -> bool:
+    """Compare two email addresses case-insensitively, treating blanks as no match."""
+    if not email or not other_email:
+        return False
+    return email.strip().lower() == other_email.strip().lower()
+
+
+async def _resolve_user_identity(
+    people_service, user_obj: dict
+) -> Tuple[str, Optional[str]]:
+    """Resolve a Chat User resource to its (display name, email).
+
+    When a Chat app authenticates as a user, Chat populates only ``name`` and
+    ``type`` on a User, so the readable name has to come from a People API
+    directory lookup. Results are cached per user ID.
+    """
+    user_id = user_obj.get("name", "")  # e.g. "users/123456789"
+    display_name = user_obj.get("displayName")
+
+    if not user_id:
+        return display_name or "Unknown Sender", None
+
+    cached = _user_identity_cache.get(user_id)
+    if cached is not None:
+        return cached
+
+    resolved_name = display_name or user_id
+    resolved_email: Optional[str] = None
+
+    # Chat API uses "users/ID" but People API expects "people/ID"
+    people_resource = user_id.replace("users/", "people/", 1)
+    if people_service:
+        try:
+            person = await asyncio.to_thread(
+                people_service.people()
+                .get(resourceName=people_resource, personFields="names,emailAddresses")
+                .execute
+            )
+            emails = person.get("emailAddresses", [])
+            if emails:
+                resolved_email = emails[0].get("value")
+            names = person.get("names", [])
+            if names:
+                resolved_name = names[0].get("displayName", resolved_name)
+            elif resolved_email and not display_name:
+                # Fall back to email if the directory has no name
+                resolved_name = resolved_email
+        except HttpError as e:
+            logger.debug(f"People API lookup failed for {user_id}: {e}")
+        except Exception as e:
+            logger.debug(f"Unexpected error resolving {user_id}: {e}")
+
+    identity = (resolved_name, resolved_email)
+    _cache_user_identity(user_id, identity)
+    return identity
 
 
 async def _resolve_sender(people_service, sender_obj: dict) -> str:
@@ -52,43 +126,128 @@ async def _resolve_sender(people_service, sender_obj: dict) -> str:
     if display_name:
         return display_name
 
-    user_id = sender_obj.get("name", "")  # e.g. "users/123456789"
-    if not user_id:
-        return "Unknown Sender"
+    name, _ = await _resolve_user_identity(people_service, sender_obj)
+    return name
 
-    # Check cache
-    if user_id in _sender_name_cache:
-        return _sender_name_cache[user_id]
 
-    # Try People API directory lookup
-    # Chat API uses "users/ID" but People API expects "people/ID"
-    people_resource = user_id.replace("users/", "people/", 1)
-    if people_service:
+async def _space_participant_names(
+    chat_service,
+    people_service,
+    space_id: str,
+    current_user_email: Optional[str],
+) -> List[str]:
+    """Names of a space's human members, excluding the authenticated user.
+
+    Requires the chat.memberships.readonly scope; callers treat a failure here
+    as "could not name this space" rather than an error.
+    """
+    response = await asyncio.to_thread(
+        chat_service.spaces()
+        .members()
+        .list(
+            parent=space_id,
+            pageSize=_SPACE_MEMBERS_PAGE_SIZE,
+            filter='member.type = "HUMAN"',
+        )
+        .execute
+    )
+
+    names: List[str] = []
+    for membership in response.get("memberships", []):
+        member = membership.get("member") or {}
+        if member.get("type", "HUMAN") != "HUMAN":
+            continue
+        name, email = await _resolve_user_identity(people_service, member)
+        if _same_user(email, current_user_email):
+            continue
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+async def _participant_names_from_messages(
+    people_service,
+    messages: List[dict],
+    current_user_email: Optional[str],
+) -> List[str]:
+    """Names of everyone who sent one of these messages, excluding the user.
+
+    Fallback for naming a DM when the memberships lookup is unavailable.
+    """
+    names: List[str] = []
+    seen_ids = set()
+    for msg in messages:
+        sender = msg.get("sender") or {}
+        sender_id = sender.get("name", "")
+        if not sender_id or sender_id in seen_ids:
+            continue
+        seen_ids.add(sender_id)
+        name, email = await _resolve_user_identity(people_service, sender)
+        if _same_user(email, current_user_email):
+            continue
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+async def _resolve_space_display_name(
+    chat_service,
+    people_service,
+    space: dict,
+    *,
+    current_user_email: Optional[str] = None,
+    messages: Optional[List[dict]] = None,
+    allow_membership_lookup: bool = True,
+) -> str:
+    """Human-readable name for a space, including direct and group chats.
+
+    Chat leaves displayName empty for direct messages and unnamed group chats,
+    so name those after their members instead of showing "Unnamed Space".
+    """
+    display_name = space.get("displayName")
+    if display_name:
+        return display_name
+
+    space_id = space.get("name", "")
+    cached = _space_name_cache.get(space_id)
+    if cached:
+        return cached
+
+    space_type = space.get("spaceType") or space.get("type") or ""
+
+    participants: List[str] = []
+    if space_id and allow_membership_lookup:
         try:
-            person = await asyncio.to_thread(
-                people_service.people()
-                .get(resourceName=people_resource, personFields="names,emailAddresses")
-                .execute
+            participants = await _space_participant_names(
+                chat_service, people_service, space_id, current_user_email
             )
-            names = person.get("names", [])
-            if names:
-                resolved = names[0].get("displayName", user_id)
-                _cache_sender(user_id, resolved)
-                return resolved
-            # Fall back to email if no name
-            emails = person.get("emailAddresses", [])
-            if emails:
-                resolved = emails[0].get("value", user_id)
-                _cache_sender(user_id, resolved)
-                return resolved
         except HttpError as e:
-            logger.debug(f"People API lookup failed for {user_id}: {e}")
+            # Most often a missing chat.memberships.readonly scope — degrade
+            # to naming the space after whoever has spoken in it.
+            logger.debug(f"Membership lookup failed for {space_id}: {e}")
         except Exception as e:
-            logger.debug(f"Unexpected error resolving {user_id}: {e}")
+            logger.debug(f"Unexpected error listing members of {space_id}: {e}")
 
-    # Final fallback
-    _cache_sender(user_id, user_id)
-    return user_id
+    if not participants and messages:
+        participants = await _participant_names_from_messages(
+            people_service, messages, current_user_email
+        )
+
+    if participants:
+        joined = ", ".join(participants)
+        resolved = (
+            f"DM: {joined}" if space_type == "DIRECT_MESSAGE" else f"Group: {joined}"
+        )
+        if space_id:
+            _cache_space_name(space_id, resolved)
+        return resolved
+
+    # Nothing resolvable — say what kind of space it is rather than "Unnamed Space"
+    if space_type == "DIRECT_MESSAGE":
+        return "Direct Message (participant unavailable)"
+    if space_type == "GROUP_CHAT":
+        return "Group Chat (participants unavailable)"
+    return "Unnamed Space"
 
 
 async def _execute_chat_request(
@@ -146,16 +305,33 @@ def _extract_rich_links(msg: dict) -> List[str]:
         openWorldHint=True,
     ),
 )
-@require_google_service("chat", "chat_spaces_readonly")
+@require_multiple_services(
+    [
+        {
+            "service_type": "chat",
+            "scopes": ["chat_spaces_readonly", "chat_memberships_readonly"],
+            "param_name": "chat_service",
+        },
+        {
+            "service_type": "people",
+            "scopes": "contacts_read",
+            "param_name": "people_service",
+        },
+    ]
+)
 @handle_http_errors("list_spaces", service_type="chat")
 async def list_spaces(
-    service,
+    chat_service,
+    people_service,
     user_google_email: str,
     page_size: int = 100,
     space_type: str = "all",  # "all", "room", "dm"
 ) -> str:
     """
     Lists Google Chat spaces (rooms and direct messages) accessible to the user.
+
+    Direct messages and unnamed group chats have no displayName in the Chat API,
+    so they are named after their members instead.
 
     Returns:
         str: A formatted list of Google Chat spaces accessible to the user.
@@ -173,15 +349,29 @@ async def list_spaces(
     if filter_param:
         request_params["filter"] = filter_param
 
-    response = await asyncio.to_thread(service.spaces().list(**request_params).execute)
+    response = await asyncio.to_thread(
+        chat_service.spaces().list(**request_params).execute
+    )
 
     spaces = response.get("spaces", [])
     if not spaces:
         return f"No Chat spaces found for type '{space_type}'."
 
+    # Resolving an unnamed space costs extra API calls, so bound how many we do.
+    resolutions_left = _MAX_UNNAMED_SPACE_RESOLUTIONS
+
     output = [f"Found {len(spaces)} Chat spaces (type: {space_type}):"]
     for space in spaces:
-        space_name = space.get("displayName", "Unnamed Space")
+        needs_resolution = not space.get("displayName")
+        space_name = await _resolve_space_display_name(
+            chat_service,
+            people_service,
+            space,
+            current_user_email=user_google_email,
+            allow_membership_lookup=resolutions_left > 0,
+        )
+        if needs_resolution:
+            resolutions_left -= 1
         space_id = space.get("name", "")
         space_type_actual = space.get("spaceType", "UNKNOWN")
         output.append(f"- {space_name} (ID: {space_id}, Type: {space_type_actual})")
@@ -200,7 +390,11 @@ async def list_spaces(
 )
 @require_multiple_services(
     [
-        {"service_type": "chat", "scopes": "chat_read", "param_name": "chat_service"},
+        {
+            "service_type": "chat",
+            "scopes": ["chat_read", "chat_memberships_readonly"],
+            "param_name": "chat_service",
+        },
         {
             "service_type": "people",
             "scopes": "contacts_read",
@@ -238,7 +432,6 @@ async def get_messages(
     space_info = await asyncio.to_thread(
         chat_service.spaces().get(name=space_id).execute
     )
-    space_name = space_info.get("displayName", "Unknown Space")
 
     # Get messages
     list_params = {"parent": space_id, "pageSize": page_size, "orderBy": order_by}
@@ -249,6 +442,17 @@ async def get_messages(
     )
 
     messages = response.get("messages", [])
+
+    # Direct messages and unnamed group chats have no displayName; name them
+    # after their members, falling back to whoever has posted in them.
+    space_name = await _resolve_space_display_name(
+        chat_service,
+        people_service,
+        space_info,
+        current_user_email=user_google_email,
+        messages=messages,
+    )
+
     if not messages:
         return f"No messages found in space '{space_name}' (ID: {space_id})."
 
@@ -425,7 +629,11 @@ async def send_message(
 )
 @require_multiple_services(
     [
-        {"service_type": "chat", "scopes": "chat_read", "param_name": "chat_service"},
+        {
+            "service_type": "chat",
+            "scopes": ["chat_read", "chat_memberships_readonly"],
+            "param_name": "chat_service",
+        },
         {
             "service_type": "people",
             "scopes": "contacts_read",
@@ -493,7 +701,27 @@ async def search_messages(
             retries=_SEARCH_MESSAGES_SSL_RETRIES,
         )
         messages = response.get("messages", [])
-        context = f"space '{space_id}'"
+        # Fetch the space so named rooms keep their name and DMs are recognised
+        # as such; a failure here only costs us a nicer label.
+        try:
+            space_info = await _execute_chat_request(
+                lambda: chat_service.spaces().get(name=space_id),
+                request_label=f"fetching space {space_id}",
+                retries=_SEARCH_MESSAGES_SSL_RETRIES,
+            )
+        except HttpError as e:
+            logger.debug(f"Could not fetch space {space_id}: {e}")
+            space_info = {"name": space_id}
+        space_display = await _resolve_space_display_name(
+            chat_service,
+            people_service,
+            space_info,
+            current_user_email=user_google_email,
+            messages=messages,
+        )
+        for msg in messages:
+            msg["_space_name"] = space_display
+        context = f"space '{space_display}' (ID: {space_id})"
     else:
         # Search across all accessible spaces
         spaces_response = await _execute_chat_request(
@@ -518,11 +746,7 @@ async def search_messages(
                     retries=_SEARCH_MESSAGES_SSL_RETRIES,
                     semaphore=fetch_semaphore,
                 )
-                msgs = response.get("messages", [])
-                display = space.get("displayName", "Unknown")
-                for msg in msgs:
-                    msg["_space_name"] = display
-                return msgs, False
+                return response.get("messages", []), False
             except HttpError as e:
                 logger.debug(
                     "Skipping space %s during search: %s", space.get("name"), e
@@ -541,9 +765,22 @@ async def search_messages(
         )
         transient_failures = 0
         messages = []
-        for batch, had_transient_failure in results:
-            messages.extend(batch)
+        # Name each space sequentially: resolution hits the memberships and
+        # People APIs, which are not safe to fan out across worker threads.
+        for space, (batch, had_transient_failure) in zip(spaces_to_search, results):
             transient_failures += int(had_transient_failure)
+            if not batch:
+                continue
+            display = await _resolve_space_display_name(
+                chat_service,
+                people_service,
+                space,
+                current_user_email=user_google_email,
+                messages=batch,
+            )
+            for msg in batch:
+                msg["_space_name"] = display
+            messages.extend(batch)
         if spaces_to_search and transient_failures == len(spaces_to_search):
             raise TransientNetworkError(
                 "A transient SSL error occurred in 'search_messages' while searching Chat spaces. "
