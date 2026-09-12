@@ -338,12 +338,13 @@ async def list_spaces(
     """
     logger.info(f"[list_spaces] Email={user_google_email}, Type={space_type}")
 
-    # Build filter based on space_type
+    # Build filter based on space_type. Chat requires the enum value to be
+    # quoted and rejects an unquoted one with INVALID_ARGUMENT.
     filter_param = None
     if space_type == "room":
-        filter_param = "spaceType = SPACE"
+        filter_param = 'spaceType = "SPACE"'
     elif space_type == "dm":
-        filter_param = "spaceType = DIRECT_MESSAGE"
+        filter_param = 'spaceType = "DIRECT_MESSAGE"'
 
     request_params = {"pageSize": page_size}
     if filter_param:

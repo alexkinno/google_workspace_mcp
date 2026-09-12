@@ -1250,3 +1250,52 @@ async def test_space_name_resolution_is_cached_across_calls():
     calls_after_first = chat_service.spaces().members().list.call_count
     assert "DM: Alice Smith" in await call()
     assert chat_service.spaces().members().list.call_count == calls_after_first
+
+
+# ---------------------------------------------------------------------------
+# list_spaces: spaceType filter syntax
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("space_type", "expected_filter"),
+    [
+        ("dm", 'spaceType = "DIRECT_MESSAGE"'),
+        ("room", 'spaceType = "SPACE"'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_list_spaces_quotes_space_type_filter(space_type, expected_filter):
+    """Chat rejects an unquoted enum value with INVALID_ARGUMENT."""
+    chat_service = Mock()
+    chat_service.spaces().list().execute.return_value = {"spaces": []}
+    people_service = Mock()
+
+    from gchat.chat_tools import list_spaces
+
+    await _unwrap(list_spaces)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+        space_type=space_type,
+    )
+
+    assert chat_service.spaces().list.call_args.kwargs["filter"] == expected_filter
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_sends_no_filter_for_all_space_types():
+    """'all' must not constrain the listing."""
+    chat_service = Mock()
+    chat_service.spaces().list().execute.return_value = {"spaces": []}
+    people_service = Mock()
+
+    from gchat.chat_tools import list_spaces
+
+    await _unwrap(list_spaces)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+    )
+
+    assert "filter" not in chat_service.spaces().list.call_args.kwargs
