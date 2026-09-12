@@ -42,6 +42,12 @@ CHAT_READONLY_SCOPE = "https://www.googleapis.com/auth/chat.messages.readonly"
 CHAT_WRITE_SCOPE = "https://www.googleapis.com/auth/chat.messages"
 CHAT_SPACES_SCOPE = "https://www.googleapis.com/auth/chat.spaces"
 CHAT_SPACES_READONLY_SCOPE = "https://www.googleapis.com/auth/chat.spaces.readonly"
+# Required to read space memberships, which is the only way to name a direct
+# message or an unnamed group chat (the Space resource has no displayName for them).
+CHAT_MEMBERSHIPS_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/chat.memberships.readonly"
+)
+CHAT_MEMBERSHIPS_SCOPE = "https://www.googleapis.com/auth/chat.memberships"
 
 # Google Sheets API scopes
 SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
@@ -104,6 +110,7 @@ SCOPE_HIERARCHY = {
     CONTACTS_SCOPE: {CONTACTS_READONLY_SCOPE},
     CHAT_WRITE_SCOPE: {CHAT_READONLY_SCOPE},
     CHAT_SPACES_SCOPE: {CHAT_SPACES_READONLY_SCOPE},
+    CHAT_MEMBERSHIPS_SCOPE: {CHAT_MEMBERSHIPS_READONLY_SCOPE},
     FORMS_BODY_SCOPE: {FORMS_BODY_READONLY_SCOPE},
     SCRIPT_PROJECTS_SCOPE: {SCRIPT_PROJECTS_READONLY_SCOPE},
     SCRIPT_DEPLOYMENTS_SCOPE: {SCRIPT_DEPLOYMENTS_READONLY_SCOPE},
@@ -164,6 +171,7 @@ CHAT_SCOPES = [
     CHAT_WRITE_SCOPE,
     CHAT_SPACES_SCOPE,
     CHAT_SPACES_READONLY_SCOPE,
+    CHAT_MEMBERSHIPS_READONLY_SCOPE,
 ]
 
 SHEETS_SCOPES = [SHEETS_READONLY_SCOPE, SHEETS_WRITE_SCOPE, DRIVE_READONLY_SCOPE]
@@ -217,7 +225,11 @@ TOOL_READONLY_SCOPES_MAP = {
     "calendar": [CALENDAR_READONLY_SCOPE],
     "docs": [DOCS_READONLY_SCOPE, DRIVE_READONLY_SCOPE],
     "sheets": [SHEETS_READONLY_SCOPE, DRIVE_READONLY_SCOPE],
-    "chat": [CHAT_READONLY_SCOPE, CHAT_SPACES_READONLY_SCOPE],
+    "chat": [
+        CHAT_READONLY_SCOPE,
+        CHAT_SPACES_READONLY_SCOPE,
+        CHAT_MEMBERSHIPS_READONLY_SCOPE,
+    ],
     "forms": [FORMS_BODY_READONLY_SCOPE, FORMS_RESPONSES_READONLY_SCOPE],
     "slides": [SLIDES_READONLY_SCOPE],
     "tasks": [TASKS_READONLY_SCOPE],

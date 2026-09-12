@@ -920,3 +920,333 @@ async def test_send_message_rejects_empty_message_name():
 
     assert messages.create.call_count == 0
     assert messages.patch.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Naming direct messages and unnamed group chats
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_chat_name_caches():
+    """Space/user name caches are module level; keep tests independent."""
+    from gchat import chat_tools
+
+    chat_tools._user_identity_cache.clear()
+    chat_tools._space_name_cache.clear()
+    yield
+    chat_tools._user_identity_cache.clear()
+    chat_tools._space_name_cache.clear()
+
+
+def _mock_people_service(directory):
+    """People service whose directory maps 'people/ID' -> (name, email)."""
+    people_service = Mock()
+
+    def get(resourceName=None, personFields=None):  # noqa: ARG001
+        request = Mock()
+        entry = directory.get(resourceName)
+        if entry is None:
+            request.execute.return_value = {}
+        else:
+            name, email = entry
+            request.execute.return_value = {
+                "names": [{"displayName": name}],
+                "emailAddresses": [{"value": email}],
+            }
+        return request
+
+    people_service.people().get.side_effect = get
+    return people_service
+
+
+def _membership(user_id):
+    return {"member": {"name": user_id, "type": "HUMAN"}}
+
+
+def _http_error(status, message):
+    from googleapiclient.errors import HttpError
+
+    resp = Mock(status=status, reason=message)
+    return HttpError(resp=resp, content=f'{{"error": "{message}"}}'.encode())
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_names_direct_message_after_other_member():
+    """A DM has no displayName; it should be named after the other participant."""
+    chat_service = Mock()
+    chat_service.spaces().list().execute.return_value = {
+        "spaces": [{"name": "spaces/DM1", "spaceType": "DIRECT_MESSAGE"}]
+    }
+    chat_service.spaces().members().list().execute.return_value = {
+        "memberships": [_membership("users/1"), _membership("users/2")]
+    }
+    people_service = _mock_people_service(
+        {
+            "people/1": ("Me Myself", "me@example.com"),
+            "people/2": ("Alice Smith", "alice@example.com"),
+        }
+    )
+
+    from gchat.chat_tools import list_spaces
+
+    result = await _unwrap(list_spaces)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+        space_type="dm",
+    )
+
+    assert "DM: Alice Smith" in result
+    assert "Unnamed Space" not in result
+    assert "Me Myself" not in result
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_names_unnamed_group_chat_after_members():
+    """An unnamed group chat should list its other members."""
+    chat_service = Mock()
+    chat_service.spaces().list().execute.return_value = {
+        "spaces": [{"name": "spaces/G1", "spaceType": "GROUP_CHAT"}]
+    }
+    chat_service.spaces().members().list().execute.return_value = {
+        "memberships": [
+            _membership("users/1"),
+            _membership("users/2"),
+            _membership("users/3"),
+        ]
+    }
+    people_service = _mock_people_service(
+        {
+            "people/1": ("Me Myself", "me@example.com"),
+            "people/2": ("Alice Smith", "alice@example.com"),
+            "people/3": ("Bob Jones", "bob@example.com"),
+        }
+    )
+
+    from gchat.chat_tools import list_spaces
+
+    result = await _unwrap(list_spaces)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+    )
+
+    assert "Group: Alice Smith, Bob Jones" in result
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_keeps_display_name_and_skips_membership_lookup():
+    """Named rooms should not trigger a memberships call."""
+    chat_service = Mock()
+    chat_service.spaces().list().execute.return_value = {
+        "spaces": [
+            {"name": "spaces/S1", "displayName": "Engineering", "spaceType": "SPACE"}
+        ]
+    }
+    people_service = Mock()
+
+    from gchat.chat_tools import list_spaces
+
+    result = await _unwrap(list_spaces)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+    )
+
+    assert "Engineering" in result
+    assert chat_service.spaces().members().list.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_get_messages_names_direct_message_space():
+    """get_messages should title a DM after the other participant, not 'Unknown Space'."""
+    msg = _make_message(text="Hi there", msg_name="spaces/DM1/messages/M1")
+    msg["sender"] = {"name": "users/2"}
+
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {
+        "name": "spaces/DM1",
+        "spaceType": "DIRECT_MESSAGE",
+    }
+    chat_service.spaces().messages().list().execute.return_value = {"messages": [msg]}
+    chat_service.spaces().members().list().execute.return_value = {
+        "memberships": [_membership("users/1"), _membership("users/2")]
+    }
+    people_service = _mock_people_service(
+        {
+            "people/1": ("Me Myself", "me@example.com"),
+            "people/2": ("Alice Smith", "alice@example.com"),
+        }
+    )
+
+    from gchat.chat_tools import get_messages
+
+    result = await _unwrap(get_messages)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+        space_id="spaces/DM1",
+    )
+
+    assert "Messages from 'DM: Alice Smith'" in result
+    assert "Unknown Space" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_messages_falls_back_to_senders_when_memberships_forbidden():
+    """Without the memberships scope, name the DM from who has posted in it."""
+    msg = _make_message(text="Hi there", msg_name="spaces/DM1/messages/M1")
+    msg["sender"] = {"name": "users/2"}
+
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {
+        "name": "spaces/DM1",
+        "spaceType": "DIRECT_MESSAGE",
+    }
+    chat_service.spaces().messages().list().execute.return_value = {"messages": [msg]}
+    chat_service.spaces().members().list().execute.side_effect = _http_error(
+        403, "insufficient scope"
+    )
+    people_service = _mock_people_service(
+        {"people/2": ("Alice Smith", "alice@example.com")}
+    )
+
+    from gchat.chat_tools import get_messages
+
+    result = await _unwrap(get_messages)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+        space_id="spaces/DM1",
+    )
+
+    assert "Messages from 'DM: Alice Smith'" in result
+
+
+@pytest.mark.asyncio
+async def test_get_messages_reports_space_kind_when_nothing_resolves():
+    """An unresolvable DM should say what it is instead of 'Unknown Space'."""
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {
+        "name": "spaces/DM1",
+        "spaceType": "DIRECT_MESSAGE",
+    }
+    chat_service.spaces().messages().list().execute.return_value = {"messages": []}
+    chat_service.spaces().members().list().execute.side_effect = _http_error(
+        403, "insufficient scope"
+    )
+    people_service = _mock_people_service({})
+
+    from gchat.chat_tools import get_messages
+
+    result = await _unwrap(get_messages)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+        space_id="spaces/DM1",
+    )
+
+    assert "Direct Message (participant unavailable)" in result
+
+
+@pytest.mark.asyncio
+async def test_search_messages_names_direct_message_spaces():
+    """Search results should attribute DM hits to the other participant."""
+    dm_msg = _make_message(text="message in dm", msg_name="spaces/DM1/messages/M1")
+    dm_msg["sender"] = {"name": "users/2"}
+
+    chat_service = Mock()
+    chat_service.spaces().list().execute.return_value = {
+        "spaces": [{"name": "spaces/DM1", "spaceType": "DIRECT_MESSAGE"}]
+    }
+    chat_service.spaces().messages().list().execute.return_value = {
+        "messages": [dm_msg]
+    }
+    chat_service.spaces().members().list().execute.return_value = {
+        "memberships": [_membership("users/1"), _membership("users/2")]
+    }
+    people_service = _mock_people_service(
+        {
+            "people/1": ("Me Myself", "me@example.com"),
+            "people/2": ("Alice Smith", "alice@example.com"),
+        }
+    )
+
+    from gchat.chat_tools import search_messages
+
+    result = await _unwrap(search_messages)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+        query="message",
+    )
+
+    assert "in 'DM: Alice Smith'" in result
+    assert "Unknown" not in result
+
+
+@pytest.mark.asyncio
+async def test_search_messages_names_single_space_target():
+    """Searching one DM by ID should label it by participant, keeping the raw ID."""
+    dm_msg = _make_message(text="message in dm", msg_name="spaces/DM1/messages/M1")
+    dm_msg["sender"] = {"name": "users/2"}
+
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {
+        "name": "spaces/DM1",
+        "spaceType": "DIRECT_MESSAGE",
+    }
+    chat_service.spaces().messages().list().execute.return_value = {
+        "messages": [dm_msg]
+    }
+    chat_service.spaces().members().list().execute.return_value = {
+        "memberships": [_membership("users/1"), _membership("users/2")]
+    }
+    people_service = _mock_people_service(
+        {
+            "people/1": ("Me Myself", "me@example.com"),
+            "people/2": ("Alice Smith", "alice@example.com"),
+        }
+    )
+
+    from gchat.chat_tools import search_messages
+
+    result = await _unwrap(search_messages)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+        query="message",
+        space_id="spaces/DM1",
+    )
+
+    assert "space 'DM: Alice Smith' (ID: spaces/DM1)" in result
+
+
+@pytest.mark.asyncio
+async def test_space_name_resolution_is_cached_across_calls():
+    """A resolved DM name should be reused without re-listing memberships."""
+    chat_service = Mock()
+    chat_service.spaces().list().execute.return_value = {
+        "spaces": [{"name": "spaces/DM1", "spaceType": "DIRECT_MESSAGE"}]
+    }
+    chat_service.spaces().members().list().execute.return_value = {
+        "memberships": [_membership("users/2")]
+    }
+    people_service = _mock_people_service(
+        {"people/2": ("Alice Smith", "alice@example.com")}
+    )
+
+    from gchat.chat_tools import list_spaces
+
+    call = lambda: _unwrap(list_spaces)(  # noqa: E731
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+        space_type="dm",
+    )
+
+    assert "DM: Alice Smith" in await call()
+    calls_after_first = chat_service.spaces().members().list.call_count
+    assert "DM: Alice Smith" in await call()
+    assert chat_service.spaces().members().list.call_count == calls_after_first
