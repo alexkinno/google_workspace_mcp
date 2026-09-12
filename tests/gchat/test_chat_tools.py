@@ -932,28 +932,38 @@ def _clear_chat_name_caches():
     """Space/user name caches are module level; keep tests independent."""
     from gchat import chat_tools
 
-    chat_tools._user_identity_cache.clear()
-    chat_tools._space_name_cache.clear()
+    for cache in (
+        chat_tools._sender_name_cache,
+        chat_tools._space_name_cache,
+        chat_tools._own_user_id_cache,
+    ):
+        cache.clear()
     yield
-    chat_tools._user_identity_cache.clear()
-    chat_tools._space_name_cache.clear()
+    for cache in (
+        chat_tools._sender_name_cache,
+        chat_tools._space_name_cache,
+        chat_tools._own_user_id_cache,
+    ):
+        cache.clear()
 
 
-def _mock_people_service(directory):
-    """People service whose directory maps 'people/ID' -> (name, email)."""
+def _mock_people_service(directory, me=None):
+    """People service whose directory maps 'people/ID' -> display name.
+
+    `me` is the caller's own resource name, as returned for 'people/me'.
+    """
     people_service = Mock()
 
     def get(resourceName=None, personFields=None):  # noqa: ARG001
         request = Mock()
-        entry = directory.get(resourceName)
-        if entry is None:
-            request.execute.return_value = {}
-        else:
-            name, email = entry
+        if resourceName == "people/me":
+            request.execute.return_value = {"resourceName": me} if me else {}
+        elif resourceName in directory:
             request.execute.return_value = {
-                "names": [{"displayName": name}],
-                "emailAddresses": [{"value": email}],
+                "names": [{"displayName": directory[resourceName]}]
             }
+        else:
+            request.execute.return_value = {}
         return request
 
     people_service.people().get.side_effect = get
@@ -982,10 +992,7 @@ async def test_list_spaces_names_direct_message_after_other_member():
         "memberships": [_membership("users/1"), _membership("users/2")]
     }
     people_service = _mock_people_service(
-        {
-            "people/1": ("Me Myself", "me@example.com"),
-            "people/2": ("Alice Smith", "alice@example.com"),
-        }
+        {"people/1": "Me Myself", "people/2": "Alice Smith"}, me="people/1"
     )
 
     from gchat.chat_tools import list_spaces
@@ -1018,10 +1025,11 @@ async def test_list_spaces_names_unnamed_group_chat_after_members():
     }
     people_service = _mock_people_service(
         {
-            "people/1": ("Me Myself", "me@example.com"),
-            "people/2": ("Alice Smith", "alice@example.com"),
-            "people/3": ("Bob Jones", "bob@example.com"),
-        }
+            "people/1": "Me Myself",
+            "people/2": "Alice Smith",
+            "people/3": "Bob Jones",
+        },
+        me="people/1",
     )
 
     from gchat.chat_tools import list_spaces
@@ -1074,10 +1082,7 @@ async def test_get_messages_names_direct_message_space():
         "memberships": [_membership("users/1"), _membership("users/2")]
     }
     people_service = _mock_people_service(
-        {
-            "people/1": ("Me Myself", "me@example.com"),
-            "people/2": ("Alice Smith", "alice@example.com"),
-        }
+        {"people/1": "Me Myself", "people/2": "Alice Smith"}, me="people/1"
     )
 
     from gchat.chat_tools import get_messages
@@ -1094,8 +1099,8 @@ async def test_get_messages_names_direct_message_space():
 
 
 @pytest.mark.asyncio
-async def test_get_messages_falls_back_to_senders_when_memberships_forbidden():
-    """Without the memberships scope, name the DM from who has posted in it."""
+async def test_get_messages_degrades_when_memberships_forbidden():
+    """Without the memberships scope, say what the space is rather than failing."""
     msg = _make_message(text="Hi there", msg_name="spaces/DM1/messages/M1")
     msg["sender"] = {"name": "users/2"}
 
@@ -1108,9 +1113,7 @@ async def test_get_messages_falls_back_to_senders_when_memberships_forbidden():
     chat_service.spaces().members().list().execute.side_effect = _http_error(
         403, "insufficient scope"
     )
-    people_service = _mock_people_service(
-        {"people/2": ("Alice Smith", "alice@example.com")}
-    )
+    people_service = _mock_people_service({"people/2": "Alice Smith"}, me="people/1")
 
     from gchat.chat_tools import get_messages
 
@@ -1121,7 +1124,9 @@ async def test_get_messages_falls_back_to_senders_when_memberships_forbidden():
         space_id="spaces/DM1",
     )
 
-    assert "Messages from 'DM: Alice Smith'" in result
+    # The tool still works, and the message itself is still attributed.
+    assert "Direct Message (participant unavailable)" in result
+    assert "Alice Smith" in result
 
 
 @pytest.mark.asyncio
@@ -1167,10 +1172,7 @@ async def test_search_messages_names_direct_message_spaces():
         "memberships": [_membership("users/1"), _membership("users/2")]
     }
     people_service = _mock_people_service(
-        {
-            "people/1": ("Me Myself", "me@example.com"),
-            "people/2": ("Alice Smith", "alice@example.com"),
-        }
+        {"people/1": "Me Myself", "people/2": "Alice Smith"}, me="people/1"
     )
 
     from gchat.chat_tools import search_messages
@@ -1204,10 +1206,7 @@ async def test_search_messages_names_single_space_target():
         "memberships": [_membership("users/1"), _membership("users/2")]
     }
     people_service = _mock_people_service(
-        {
-            "people/1": ("Me Myself", "me@example.com"),
-            "people/2": ("Alice Smith", "alice@example.com"),
-        }
+        {"people/1": "Me Myself", "people/2": "Alice Smith"}, me="people/1"
     )
 
     from gchat.chat_tools import search_messages
@@ -1233,9 +1232,7 @@ async def test_space_name_resolution_is_cached_across_calls():
     chat_service.spaces().members().list().execute.return_value = {
         "memberships": [_membership("users/2")]
     }
-    people_service = _mock_people_service(
-        {"people/2": ("Alice Smith", "alice@example.com")}
-    )
+    people_service = _mock_people_service({"people/2": "Alice Smith"}, me="people/1")
 
     from gchat.chat_tools import list_spaces
 
@@ -1250,3 +1247,52 @@ async def test_space_name_resolution_is_cached_across_calls():
     calls_after_first = chat_service.spaces().members().list.call_count
     assert "DM: Alice Smith" in await call()
     assert chat_service.spaces().members().list.call_count == calls_after_first
+
+
+# ---------------------------------------------------------------------------
+# list_spaces: spaceType filter syntax
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("space_type", "expected_filter"),
+    [
+        ("dm", 'spaceType = "GROUP_CHAT" OR spaceType = "DIRECT_MESSAGE"'),
+        ("room", 'spaceType = "SPACE"'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_list_spaces_quotes_space_type_filter(space_type, expected_filter):
+    """Chat rejects an unquoted enum value with INVALID_ARGUMENT."""
+    chat_service = Mock()
+    chat_service.spaces().list().execute.return_value = {"spaces": []}
+    people_service = Mock()
+
+    from gchat.chat_tools import list_spaces
+
+    await _unwrap(list_spaces)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+        space_type=space_type,
+    )
+
+    assert chat_service.spaces().list.call_args.kwargs["filter"] == expected_filter
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_sends_no_filter_for_all_space_types():
+    """'all' must not constrain the listing."""
+    chat_service = Mock()
+    chat_service.spaces().list().execute.return_value = {"spaces": []}
+    people_service = Mock()
+
+    from gchat.chat_tools import list_spaces
+
+    await _unwrap(list_spaces)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="me@example.com",
+    )
+
+    assert "filter" not in chat_service.spaces().list.call_args.kwargs
