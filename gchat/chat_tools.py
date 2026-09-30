@@ -24,6 +24,8 @@ from core.utils import TransientNetworkError, UserInputError, handle_http_errors
 from gchat.chat_helpers import (
     _execute_chat_request,
     _extract_rich_links,
+    _list_memberships,
+    _lookup_people_names,
     _name_spaces,
     _none_if_blank,
     _none_if_null_sentinel,
@@ -102,6 +104,85 @@ async def list_spaces(
         space_name = space_labels[space.get("name")]
         space_type_actual = space.get("spaceType", "UNKNOWN")
         output.append(f"- {space_name} (ID: {space_id}, Type: {space_type_actual})")
+
+    return "\n".join(output)
+
+
+@server.tool(
+    title="List Members",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_multiple_services(
+    [
+        {
+            "service_type": "chat",
+            "scopes": "chat_memberships_readonly",
+            "param_name": "chat_service",
+        },
+        {
+            "service_type": "people",
+            "scopes": "contacts_read",
+            "param_name": "people_service",
+        },
+    ]
+)
+@handle_http_errors("list_members", service_type="chat")
+async def list_members(
+    chat_service,
+    people_service,
+    user_google_email: str,
+    space_id: str,
+) -> str:
+    """
+    Lists the human members of a Google Chat space with their user IDs.
+
+    Use the returned mention token (e.g. <users/123>) in send_message's
+    message_text to @-mention that member. Members whose names cannot be
+    resolved are counted but get no token.
+
+    Args:
+        space_id: Space resource name, e.g. spaces/X (from list_spaces).
+
+    Returns:
+        str: A formatted list of members with their names and mention tokens.
+    """
+    logger.info(f"[list_members] Email={user_google_email}, Space={space_id}")
+
+    memberships = await _list_memberships(chat_service, space_id)
+    user_ids = []
+    for membership in memberships:
+        member = membership.get("member", {})
+        if member.get("type") == "HUMAN" and member.get("name"):
+            user_ids.append(member["name"])
+    if not user_ids:
+        return f"No human members found in space '{space_id}'."
+
+    # Without a name the model cannot tell members apart, and a guessed
+    # token would mention the wrong person, so unnamed members get none.
+    names = await _lookup_people_names(people_service, user_ids)
+    named_ids = [user_id for user_id in user_ids if user_id in names]
+    plural = "s" if len(user_ids) != 1 else ""
+    if not named_ids:
+        return (
+            f"Could not resolve the names of the {len(user_ids)} human member{plural} "
+            f"of space '{space_id}' (is the People API enabled?), so no one can "
+            "be mentioned by name. Send the message without mentions."
+        )
+
+    output = [f"Found {len(user_ids)} human member{plural} in space '{space_id}':"]
+    for user_id in named_ids:
+        output.append(f"- {names[user_id]} (mention: <{user_id}>)")
+    unnamed = len(user_ids) - len(named_ids)
+    if unnamed:
+        output.append(
+            f"{unnamed} other member{'s' if unnamed != 1 else ''} could not be "
+            "named and cannot be mentioned."
+        )
 
     return "\n".join(output)
 
@@ -255,6 +336,10 @@ async def send_message(
     Sends a message to a Google Chat space, or edits a message already sent there.
 
     Args:
+        message_text: Message text. To @-mention someone, write <users/USER_ID>
+            (get IDs from list_members); <users/all> mentions everyone.
+            Chat renders the token as the member's name, so do not repeat it.
+            A plain "@Name" is sent as text and does not mention anyone.
         thread_name: Reply in an existing thread by its resource name (e.g. spaces/X/threads/Y).
         thread_key: Reply in a thread by app-defined key (creates thread if not found).
         message_name: Edit this message in place instead of sending a new one

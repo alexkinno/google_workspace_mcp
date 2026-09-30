@@ -38,6 +38,7 @@ from auth.permissions import get_scopes_for_permission, set_permissions
 from gchat.chat_tools import (
     download_chat_attachment,
     get_messages,
+    list_members,
     list_spaces,
     search_messages,
 )
@@ -148,7 +149,13 @@ class TestChatScopes:
     )
     @pytest.mark.parametrize(
         "tool",
-        [list_spaces, get_messages, search_messages, download_chat_attachment],
+        [
+            list_spaces,
+            list_members,
+            get_messages,
+            search_messages,
+            download_chat_attachment,
+        ],
         ids=lambda tool: tool.__name__,
     )
     def test_requested_scopes_cover_chat_read_tools(self, configure, tool):

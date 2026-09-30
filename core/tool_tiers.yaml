@@ -101,6 +101,7 @@ sheets:
 chat:
   core:
     - send_message
+    - list_members
     - get_messages
     - search_messages
     - create_reaction

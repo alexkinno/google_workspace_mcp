@@ -15,6 +15,15 @@ Lists Google Chat spaces (rooms and direct messages) accessible to the user.
 | page_size | integer | no | 100 | |
 | space_type | string | no | "all" | |
 
+### list_members
+Lists the human members of a space with their mention tokens (e.g. `<users/123>`).
+Requires the `chat.memberships.readonly` scope (requested with the Chat scopes; tokens granted before it was added need re-consent for this tool). Names come from the People API via `contacts.readonly`. A member whose name cannot be resolved gets no mention token, so the wrong person is never mentioned by guess; if no name resolves (e.g. the People API is disabled), the tool says so and lists no tokens.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| space_id | string | yes | | |
+
 ---
 
 ## Messages
@@ -46,7 +55,7 @@ Sends a message to a Google Chat space. Can reply to existing threads, or edit a
 |-----------|------|----------|---------|-------|
 | user_google_email | string | yes | | |
 | space_id | string | yes | | |
-| message_text | string | yes | | |
+| message_text | string | yes | | `<users/USER_ID>` mentions a member, `<users/all>` everyone |
 | thread_key | any | no | | App-defined key; creates thread if not found |
 | thread_name | any | no | | Resource name, e.g. `spaces/X/threads/Y` |
 | message_name | any | no | | Edit this message in place, e.g. `spaces/X/messages/Y`; must sit in `space_id`, own messages only, cannot be combined with a thread parameter |
@@ -80,6 +89,8 @@ Downloads an attachment from a Chat message. Returns a local file path (stdio mo
 **Space IDs**: Call `list_spaces` first to discover available spaces and their IDs. You need the space ID for all message operations.
 
 **Unnamed spaces**: Direct messages and group chats have no name of their own, so `list_spaces`, `get_messages` and `search_messages` label them after up to three other members (e.g. `Alice Smith, Bob Jones and 2 others`). Naming needs the `chat.memberships.readonly` and `contacts.readonly` scopes (requested with the Chat scopes) and the People API enabled in the Google Cloud project. Tokens granted before `chat.memberships.readonly` was added keep working without re-consent. If the member lookup fails, for example because that scope is missing, the label falls back to `Direct message` or `Group chat`; if only a member's name cannot be resolved, their user ID (e.g. `users/123`) is shown in its place.
+
+**Mentions**: A plain `@Name` in `message_text` is sent as text and notifies no one. Get the member's token from `list_members` and put it in the text, e.g. `Hi <users/123>, please review`. Chat renders it as the member's name, so don't repeat the name next to it.
 
 **Message resource names**: Messages are identified by their full resource name in the format `spaces/SPACE_ID/messages/MESSAGE_ID`. This is the value expected by `create_reaction` and `download_chat_attachment`.
 

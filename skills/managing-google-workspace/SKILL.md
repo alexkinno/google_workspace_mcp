@@ -222,6 +222,7 @@ For parameters: [references/contacts.md](references/contacts.md)
 | Task | Tool |
 |------|------|
 | List spaces | `list_spaces` |
+| List members (for @-mentions) | `list_members` |
 | Get messages | `get_messages` |
 | Search messages | `search_messages` |
 | Send message | `send_message` |
